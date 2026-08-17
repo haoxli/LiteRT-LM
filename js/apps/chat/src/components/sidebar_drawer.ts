@@ -497,7 +497,7 @@ export class LitertSidebar extends LitElement {
 
       <!-- Static Inference Config Group -->
       <div class="control-group" style="border-top: 1px solid var(--border); padding-top: 8px;">
-        <!-- Side-by-side Context & Max Gen Row -->
+        <!-- Side-by-side Context, Max Gen & Min Gen Row -->
         <div style="display: flex; gap: 10px; margin-bottom: 6px;">
           <div style="flex: 1; display: flex; flex-direction: column; gap: 4px;">
             <label for="context-length" style="font-size: 0.65rem;">Context Length</label>
@@ -514,6 +514,14 @@ export class LitertSidebar extends LitElement {
             this.state.settings
                 .maxOutputTokens)} min="128" step="64" style="padding: 8px 4px; font-size: 0.72rem; width: 100%; box-sizing: border-box; text-align: center;" @input=${
         (e: Event) => this.handleSliderInput(e, 'maxOutputTokens')}>
+          </div>
+          <div style="flex: 1; display: flex; flex-direction: column; gap: 4px;">
+            <label for="min-output-tokens" style="font-size: 0.65rem;">Min Gen</label>
+            <input type="number" id="min-output-tokens" .value=${
+        String(
+            this.state.settings
+                .minOutputTokens)} min="0" step="32" style="padding: 8px 4px; font-size: 0.72rem; width: 100%; box-sizing: border-box; text-align: center;" @input=${
+        (e: Event) => this.handleSliderInput(e, 'minOutputTokens')}>
           </div>
         </div>
 

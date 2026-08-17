@@ -32,6 +32,7 @@ export const SettingsSchema = z.object({
   selectedModelPath: z.string(),
   contextLength: z.number().int().positive(),
   maxOutputTokens: z.number().int().positive(),
+  minOutputTokens: z.number().int().nonnegative(),
   samplerType: z.string(),
   temperature: z.number().min(0),
   topP: z.number().min(0).max(1),
@@ -99,6 +100,7 @@ export class SettingsStore implements Settings {
   selectedModelPath = MODELS[0]!.path;
   contextLength = 4096;
   maxOutputTokens = 2048;
+  minOutputTokens = 0;
   samplerType = 'greedy';
   temperature = 1.0;
   topP = 0.95;
@@ -139,6 +141,8 @@ export class SettingsStore implements Settings {
           this.contextLength = validated.contextLength ?? this.contextLength;
           this.maxOutputTokens =
               validated.maxOutputTokens ?? this.maxOutputTokens;
+          this.minOutputTokens =
+              validated.minOutputTokens ?? this.minOutputTokens;
           this.samplerType = validated.samplerType ?? this.samplerType;
           this.temperature = validated.temperature ?? this.temperature;
           this.topP = validated.topP ?? this.topP;
@@ -163,6 +167,7 @@ export class SettingsStore implements Settings {
         selectedModelPath: this.selectedModelPath,
         contextLength: this.contextLength,
         maxOutputTokens: this.maxOutputTokens,
+        minOutputTokens: this.minOutputTokens,
         samplerType: this.samplerType,
         temperature: this.temperature,
         topP: this.topP,
@@ -185,6 +190,7 @@ export class SettingsStore implements Settings {
 
     this.contextLength = 4096;
     this.maxOutputTokens = 2048;
+    this.minOutputTokens = 0;
     this.samplerType = 'greedy';
     this.temperature = 1.0;
     this.topP = 0.95;

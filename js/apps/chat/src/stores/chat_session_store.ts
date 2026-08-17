@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-import {AutoToolChat, ChatInterface, JsonValue, SamplerType, ToolProgressEvent, ToolWithImplementation} from '@litert-lm/core';
+import {AutoToolChat, ChatInterface, JsonValue, Message, SamplerType, ToolProgressEvent, ToolWithImplementation} from '@litert-lm/core';
 import {z} from 'zod';
 
 import {CodeSandbox} from '../components/code_sandbox.js';
@@ -320,66 +320,130 @@ export class ChatSessionStore {
     let fullThoughtText = '';
     let tokenCount = 0;
 
-    try {
-      const responseStream =
-          await this.activeConversation!.sendMessageStreaming(promptText);
-      const reader = responseStream.getReader();
+    const appendStreamedValue = (value: Message) => {
+      if (value.channels && typeof value.channels['thought'] === 'string') {
+        fullThoughtText += value.channels['thought'];
+        this.messages[activeMsgIndex] = {
+          ...this.messages[activeMsgIndex]!,
+          thoughtText: fullThoughtText
+        };
+      }
+
+      if (value.content) {
+        const newChunkText = typeof value.content === 'string' ?
+            value.content :
+            (value.content[0]?.['text'] || '');
+
+        fullResponseText += newChunkText;
+        this.messages[activeMsgIndex] = {
+          ...this.messages[activeMsgIndex]!,
+          text: fullResponseText
+        };
+        tokenCount++;
+      }
+
+      this.updateCallback();
+    };
+
+    let promptTokens = 0;
+    let prefillSpeedVal = '0.0';
+    let totalDecodeTokens = 0;
+    let totalDecodeTimeSec = 0;
+
+    // getBenchmarkInfo() only reports the most recent sendMessage*() call, so
+    // it must be sampled after every round (including continuations) and
+    // accumulated rather than read once at the end.
+    const recordRoundBenchmark = async (isFirstRound: boolean) => {
+      try {
+        const benchmark = await this.activeConversation!.getBenchmarkInfo();
+
+        if (isFirstRound && benchmark.lastPrefillTokenCount > 0) {
+          promptTokens = benchmark.lastPrefillTokenCount;
+          prefillSpeedVal = benchmark.lastPrefillTokensPerSecond.toFixed(1);
+        }
+
+        if (benchmark.lastDecodeTokenCount > 0) {
+          totalDecodeTokens += benchmark.lastDecodeTokenCount;
+          if (benchmark.lastDecodeTokensPerSecond > 0) {
+            totalDecodeTimeSec += benchmark.lastDecodeTokenCount /
+                benchmark.lastDecodeTokensPerSecond;
+          }
+        }
+      } catch (e) {
+        console.warn('Benchmark metrics not available:', e);
+      }
+    };
+
+    // Runs one sendMessageStreaming() round. The engine only enforces
+    // maxOutputTokens per individual call (a 'Continue.' call gets its own
+    // fresh budget), so this live-caps the round itself: each streamed chunk
+    // (content or "thought" channel text) corresponds to roughly one decode
+    // step, so cancelling once this round's chunk count reaches the
+    // remaining budget (maxOutputTokens minus what prior rounds actually
+    // decoded, per getBenchmarkInfo()) keeps the cumulative real decode
+    // count from exceeding maxOutputTokens, instead of letting every round
+    // run all the way to its own independent cap.
+    const runGenerationRound =
+        async (message: string, isFirstRound: boolean) => {
+      const remainingBudget =
+          this.settings.maxOutputTokens - totalDecodeTokens;
+      if (remainingBudget <= 0) return;
+
+      const stream = this.activeConversation!.sendMessageStreaming(message);
+      const reader = stream.getReader();
+      let roundChunkCount = 0;
 
       while (true) {
         if (this.isCancelled) {
-          console.log('[LiteRT-LM] Inference stream loop cancelled.');
           await reader.cancel('User cancelled');
           break;
         }
 
         const {done, value} = await reader.read();
         if (done) break;
-
-        if (value && value.channels &&
-            typeof value.channels['thought'] === 'string') {
-          fullThoughtText += value.channels['thought'];
-          this.messages[activeMsgIndex] = {
-            ...this.messages[activeMsgIndex]!,
-            thoughtText: fullThoughtText
-          };
+        if (value) {
+          appendStreamedValue(value);
+          roundChunkCount++;
+          if (roundChunkCount >= remainingBudget) {
+            await reader.cancel('Reached max output tokens');
+            break;
+          }
         }
-
-        if (value && value.content) {
-          const newChunkText = typeof value.content === 'string' ?
-              value.content :
-              (value.content[0]?.['text'] || '');
-
-          fullResponseText += newChunkText;
-          this.messages[activeMsgIndex] = {
-            ...this.messages[activeMsgIndex]!,
-            text: fullResponseText
-          };
-        }
-
-        tokenCount++;
-        this.updateCallback();
       }
 
-      let promptTokens = 0;
-      let finalDecodeTokens = tokenCount;
-      let prefillSpeedVal = '0.0';
-      let decodeSpeedVal = '0.0';
+      await recordRoundBenchmark(isFirstRound);
+    };
 
-      try {
-        const benchmark = await this.activeConversation!.getBenchmarkInfo();
+    try {
+      await runGenerationRound(promptText, /* isFirstRound= */ true);
 
-        if (benchmark.lastPrefillTokenCount > 0) {
-          promptTokens = benchmark.lastPrefillTokenCount;
-          prefillSpeedVal = benchmark.lastPrefillTokensPerSecond.toFixed(1);
+      // The engine has no native minimum-length control, so if the model
+      // stopped short of minOutputTokens, nudge it to keep going by
+      // resending on the same conversation (preserving KV cache/history)
+      // and stitching the extra output onto the same assistant bubble. This
+      // is a best-effort approximation, not a true generation constraint.
+      const MAX_CONTINUATION_ROUNDS = 5;
+      let continuationRounds = 0;
+      while (!this.isCancelled &&
+             totalDecodeTokens < this.settings.minOutputTokens &&
+             totalDecodeTokens < this.settings.maxOutputTokens &&
+             continuationRounds < MAX_CONTINUATION_ROUNDS) {
+        continuationRounds++;
+        const decodeTokensBeforeContinuation = totalDecodeTokens;
+
+        await runGenerationRound('Continue.', /* isFirstRound= */ false);
+
+        if (totalDecodeTokens === decodeTokensBeforeContinuation) {
+          // Model produced nothing new; stop rather than loop forever.
+          break;
         }
-
-        if (benchmark.lastDecodeTokenCount > 0) {
-          finalDecodeTokens = benchmark.lastDecodeTokenCount;
-          decodeSpeedVal = benchmark.lastDecodeTokensPerSecond.toFixed(1);
-        }
-      } catch (e) {
-        console.warn('Benchmark metrics not available:', e);
       }
+
+      const finalDecodeTokens =
+          totalDecodeTokens > 0 ? totalDecodeTokens : tokenCount;
+      const decodeSpeedVal = totalDecodeTimeSec > 0 ?
+          (totalDecodeTokens / totalDecodeTimeSec).toFixed(1) :
+          '0.0';
 
       this.messages[activeMsgIndex - 1] = {
         ...this.messages[activeMsgIndex - 1]!,
