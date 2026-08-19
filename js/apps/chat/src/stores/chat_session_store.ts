@@ -350,10 +350,41 @@ export class ChatSessionStore {
     let totalDecodeTokens = 0;
     let totalDecodeTimeSec = 0;
 
-    // getBenchmarkInfo() only reports the most recent sendMessage*() call, so
-    // it must be sampled after every round (including continuations) and
-    // accumulated rather than read once at the end.
-    const recordRoundBenchmark = async (isFirstRound: boolean) => {
+    // Runs one sendMessageStreaming() round to completion (or until the user
+    // cancels), then retroactively enforces maxOutputTokens on the result.
+    //
+    // The engine enforces maxOutputTokens as a hard cap per individual call
+    // (a 'Continue.' round used to satisfy minOutputTokens gets its own fresh
+    // budget -- the WASM API has no way to lower it for a follow-up call), so
+    // a continuation round can by itself push the cumulative total past
+    // maxOutputTokens. The real per-round decode token count is only known
+    // from getBenchmarkInfo() after the round finishes (streamed chunk counts
+    // don't map 1:1 to decode steps -- some steps emit no visible text at
+    // all, e.g. partial BPE sequences), so instead of trying to predict and
+    // cut the stream short mid-flight, let the round finish and then truncate
+    // whatever it appended down to the remaining budget.
+    const runGenerationRound =
+        async (message: string, isFirstRound: boolean) => {
+      const responseTextBefore = fullResponseText;
+      const thoughtTextBefore = fullThoughtText;
+
+      const stream = this.activeConversation!.sendMessageStreaming(message);
+      const reader = stream.getReader();
+
+      while (true) {
+        if (this.isCancelled) {
+          await reader.cancel('User cancelled');
+          break;
+        }
+
+        const {done, value} = await reader.read();
+        if (done) break;
+        if (value) {
+          appendStreamedValue(value);
+        }
+      }
+
+      const decodeTokensBefore = totalDecodeTokens;
       try {
         const benchmark = await this.activeConversation!.getBenchmarkInfo();
 
@@ -372,46 +403,38 @@ export class ChatSessionStore {
       } catch (e) {
         console.warn('Benchmark metrics not available:', e);
       }
-    };
 
-    // Runs one sendMessageStreaming() round. The engine only enforces
-    // maxOutputTokens per individual call (a 'Continue.' call gets its own
-    // fresh budget), so this live-caps the round itself: each streamed chunk
-    // (content or "thought" channel text) corresponds to roughly one decode
-    // step, so cancelling once this round's chunk count reaches the
-    // remaining budget (maxOutputTokens minus what prior rounds actually
-    // decoded, per getBenchmarkInfo()) keeps the cumulative real decode
-    // count from exceeding maxOutputTokens, instead of letting every round
-    // run all the way to its own independent cap.
-    const runGenerationRound =
-        async (message: string, isFirstRound: boolean) => {
-      const remainingBudget =
-          this.settings.maxOutputTokens - totalDecodeTokens;
-      if (remainingBudget <= 0) return;
+      const maxOutputTokens = this.settings.maxOutputTokens;
+      const roundDecodeTokens = totalDecodeTokens - decodeTokensBefore;
+      if (roundDecodeTokens > 0 && totalDecodeTokens > maxOutputTokens) {
+        // This round overshot the budget. Keep only the proportional share of
+        // the text it appended that fits in the remaining budget. This is an
+        // approximation (character count isn't an exact proxy for token
+        // count either), but it keeps the displayed token count and text
+        // length from both wildly exceeding what the user configured.
+        const allowedThisRound =
+            Math.max(0, maxOutputTokens - decodeTokensBefore);
+        const keepFraction = allowedThisRound / roundDecodeTokens;
 
-      const stream = this.activeConversation!.sendMessageStreaming(message);
-      const reader = stream.getReader();
-      let roundChunkCount = 0;
+        const truncateAppended = (before: string, after: string) => {
+          const appendedLength = after.length - before.length;
+          const keepLength = Math.round(appendedLength * keepFraction);
+          return before +
+              after.slice(before.length, before.length + keepLength);
+        };
 
-      while (true) {
-        if (this.isCancelled) {
-          await reader.cancel('User cancelled');
-          break;
-        }
+        fullResponseText =
+            truncateAppended(responseTextBefore, fullResponseText);
+        fullThoughtText = truncateAppended(thoughtTextBefore, fullThoughtText);
 
-        const {done, value} = await reader.read();
-        if (done) break;
-        if (value) {
-          appendStreamedValue(value);
-          roundChunkCount++;
-          if (roundChunkCount >= remainingBudget) {
-            await reader.cancel('Reached max output tokens');
-            break;
-          }
-        }
+        this.messages[activeMsgIndex] = {
+          ...this.messages[activeMsgIndex]!,
+          text: fullResponseText,
+          thoughtText: fullThoughtText,
+        };
+        totalDecodeTokens = maxOutputTokens;
+        this.updateCallback();
       }
-
-      await recordRoundBenchmark(isFirstRound);
     };
 
     try {
